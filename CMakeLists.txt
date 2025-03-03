@@ -5,8 +5,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
 
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=thread -fno-omit-frame-pointer")
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=thread")
+set(CXX_SANITIZER "-fsanitize=undefined -fno-omit-frame-pointer")
+set(LD_SANITIZER "-fsanitize=undefined")
+
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_SANITIZER}")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${LD_SANITIZER}")
 
 
 project(
@@ -37,7 +41,7 @@ ExternalProject_Add(
     BUILD_IN_SOURCE TRUE
     BUILD_JOB_SERVER_AWARE TRUE
     CONFIGURE_COMMAND
-      sh -c "./autogen.sh && ./configure --prefix=${LIBFABRIC_INSTALL_DIR} \
+      sh -c "./autogen.sh && ./configure --prefix=${LIBFABRIC_INSTALL_DIR} LDFLAGS='${LD_SANITIZER}' CFLAGS='${CXX_SANITIZER}' \
              ${LIBFABRIC_PROVIDER_OPTS}"
     BUILD_COMMAND make -j ${NUM_CPUS}
     INSTALL_COMMAND make install

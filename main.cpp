@@ -34,15 +34,18 @@ namespace {
   hints->domain_attr->mr_mode =
       FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
   hints->domain_attr->name = nullptr;
-  hints->fabric_attr->prov_name = strdup("shm");
+  hints->fabric_attr->prov_name = strdup("verbs");
+  // hints->fabric_attr->prov_name = strdup("shm");
 
   hints->domain_attr->resource_mgmt = FI_RM_ENABLED;
   hints->ep_attr->type = FI_EP_RDM;
-  hints->ep_attr->protocol = FI_PROTO_UNSPEC;
+  hints->ep_attr->protocol = FI_PROTO_RXM;
+  // hints->ep_attr->protocol = FI_PROTO_UNSPEC;
   hints->addr_format = FI_FORMAT_UNSPEC;
   hints->dest_addr = nullptr;
   hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
   hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+  hints->mode = FI_CONTEXT;
   hints->caps = FI_MSG |  FI_RMA | FI_TAGGED | FI_SOURCE |  FI_DIRECTED_RECV;
 
   return hints;
@@ -100,18 +103,20 @@ void CHECK(int ret, const std::source_location location = std::source_location::
 
 int main() {
 
-static constexpr size_t bufferSize{1000};
+static constexpr size_t bufferSize{4096};
+static constexpr size_t clientsCnt{100};
 
 std::vector<char> serverAddr{};
-std::vector<char> clientAddr{};
+std::vector<std::vector<char>> clientAddr(clientsCnt, std::vector<char>(1000));
 uint32_t serverAddrFormat = 0;
 std::mutex serverDataMtx;
 std::condition_variable serverCv;
 std::mutex clientDataMtx;
-std::condition_variable clientCv;
+std::vector<std::condition_variable> clientCv(clientsCnt);
 
 bool serverDataReady = false;
-bool clientDataReady = false;
+bool serverDone = false;
+std::vector<bool> clientDataReady (clientsCnt, false);
 
 std::thread server([&]{
     fi_info *hints = makeHints();
@@ -120,7 +125,7 @@ std::thread server([&]{
     fid_domain *domain = nullptr;
     fid_ep *ep = nullptr;
     fid_cq *rxCq = nullptr;
-    fid_cq *txCq = nullptr;
+    fid_cq *  txCq = nullptr;
     fid_av *av = nullptr;
 
     auto rxCqAttr = initCqAttrDefault();
@@ -141,7 +146,7 @@ std::thread server([&]{
     CHECK(fi_ep_bind(ep, &av->fid, 0));
     CHECK(fi_enable(ep));
 
-    auto buf = malloc(bufferSize);
+    auto buf = aligned_alloc(16, bufferSize);
     std::size_t PP_MR_KEY = 0xC0DE;
     fid_mr *mr = nullptr;
     auto flags = FI_SEND | FI_RECV | FI_REMOTE_READ | FI_REMOTE_WRITE;
@@ -159,21 +164,55 @@ std::thread server([&]{
         serverAddr = localAddr;
         serverAddrFormat = info->addr_format;
         serverDataReady = true;
-        serverCv.notify_one();
+    }
+    serverCv.notify_all();
+
+    for (size_t i= 0; i<clientsCnt; i++) {
+      {
+        printf("SERVER waiting for #%ld\n", i);
+        std::unique_lock lock(clientDataMtx);
+        clientCv[i].wait(lock, [&] { return clientDataReady[i]; });
+      }
+
+      fi_addr_t remoteFiAddr = 0;
+      CHECK(fi_av_insert(av, clientAddr[i].data(), 1, &remoteFiAddr, 0, nullptr) <
+            0);
+
+      printf("SERVER fi_recv\n");
+      while (fi_recv(ep, buf, bufferSize, fi_mr_desc(mr),
+                                      remoteFiAddr, nullptr)) {
+      };
+
+      fi_cq_err_entry comp{};
+
+      // auto ret = fi_cq_readfrom(rxCq, &comp, 1, &comp.src_addr);
+      printf("SERVER fi_cq_readfrom from #%ld\n", i);
+      while (1) {
+        const auto ret = fi_cq_readfrom(rxCq, &comp, 1, &comp.src_addr);
+        if (ret == 1) break;
+        if (ret == -FI_EAGAIN || ret == -FI_EINTR)
+          // printf("SERVER FI_EAGAIN fi_cq_readerr from #%ld\n", i);
+          continue;
+        if (ret == -FI_EAVAIL) {
+          printf("SERVER FI_EAVAIL fi_cq_readerr from #%ld\n", i);
+          fi_cq_readerr(rxCq, &comp, 0);
+          continue;
+        }
+        [[unlikely]] if (ret < 0) {
+          printf("SERVER Error in rea from #%ld\n", i);
+          throw std::runtime_error("Cq wait unexpected error");
+        }
+      };
+
+      printf("SERVER comp.flags=%lld comp.src_addr=%ld\n", comp.flags & FI_RECV,
+             comp.src_addr);
     }
 
-    std::unique_lock lock(clientDataMtx);
-    clientCv.wait(lock, [&] { return clientDataReady; });
-
-    fi_addr_t remoteFiAddr = 0;
-    CHECK(fi_av_insert(av, clientAddr.data(), 1, &remoteFiAddr, 0, nullptr) < 0);
-
-
-    while (fi_recv(ep, buf, bufferSize, fi_mr_desc(mr), remoteFiAddr, nullptr) != 0);
-
-    fi_cq_err_entry comp{};
-
-    while (fi_cq_readfrom(rxCq, &comp, 1, &comp.src_addr) < 0);
+    {
+      std::unique_lock lock(serverDataMtx);
+      serverDone = true;
+    }
+    serverCv.notify_all();
 
     fi_close(&mr->fid);
     free(buf);
@@ -187,7 +226,7 @@ std::thread server([&]{
     fi_freeinfo(hints);
 });
 
-std::thread client([&]{
+const auto clientLam = ([&](int rank){
     fi_info *hints = makeHints();
     fi_info *info = nullptr;
     fid_fabric *fabric = nullptr;
@@ -200,9 +239,13 @@ std::thread client([&]{
     auto txCqAtrr = initCqAttrDefault();
     auto avAttr = initAvAttrDefault();
 
+    printf("CLIENT #%d BEFORE START\n",rank);
+    {
     std::unique_lock lock(serverDataMtx);
     serverCv.wait(lock, [&] { return serverDataReady; });
+    }
 
+    printf("CLIENT #%d START\n",rank);
     hints->dest_addrlen = serverAddr.size();
     hints->addr_format = serverAddrFormat;
     hints->dest_addr = serverAddr.data();
@@ -222,7 +265,7 @@ std::thread client([&]{
     CHECK(fi_ep_bind(ep, &av->fid, 0));
     CHECK(fi_enable(ep));
 
-    auto buf = malloc(bufferSize);
+    auto buf = aligned_alloc(16, bufferSize);
     std::size_t PP_MR_KEY = 0xC0DE;
     fid_mr *mr = nullptr;
     auto flags = FI_SEND | FI_RECV;
@@ -232,10 +275,11 @@ std::thread client([&]{
 
     {
         std::unique_lock lock(clientDataMtx);
-        clientAddr = localAddr;
-        clientDataReady = true;
-        clientCv.notify_one();
+        clientAddr[rank] = localAddr;
+        clientDataReady[rank] = true;
+        printf("CLIENT #%d clientDataReady\n", rank);
     }
+    clientCv[rank].notify_one();
 
     fi_addr_t localFiAddr = 0;
     if (info->domain_attr->caps & FI_LOCAL_COMM) {
@@ -247,11 +291,24 @@ std::thread client([&]{
     fi_addr_t remoteFiAddr = 0;
     CHECK(fi_av_insert(av, hints->dest_addr, 1, &remoteFiAddr, 0, nullptr) < 0);
 
-    while (fi_send(ep, buf, bufferSize, fi_mr_desc(mr), remoteFiAddr, nullptr) != 0);
+    printf("CLIENT #%d fi_send\n", rank);
+    while (fi_send(ep, buf, bufferSize, fi_mr_desc(mr), remoteFiAddr, nullptr) != 0) {
+    };
 
     fi_cq_err_entry comp{};
 
-    while (fi_cq_readfrom(txCq, &comp, 1, &comp.src_addr) < 0);
+    while (fi_cq_readfrom(txCq, &comp, 1, &comp.src_addr) < 0) {
+      printf("CLIENT #%d fi_cq_readfrom\n", rank);
+    };
+
+    printf("CLIENT #%d comp.flags=%lld comp.src_addr=%ld\n", rank, comp.flags & FI_SEND, comp.src_addr);
+
+    {
+      std::unique_lock lock(serverDataMtx);
+      printf("CLIENT #%d waiting for serverDone\n", rank);
+      serverCv.wait(lock, [&] { return serverDone; });
+    }
+    printf("CLIENT #%d ended waiting for serverDone\n", rank);
 
     fi_close(&mr->fid);
     free(buf);
@@ -266,8 +323,14 @@ std::thread client([&]{
     fi_freeinfo(hints);
 });
 
+std::vector<std::thread> clients;
+clients.reserve(clientsCnt);
+for (size_t i=0; i<clientsCnt; i++)
+  clients.emplace_back(clientLam, i);
+
 server.join();
-client.join();
+for (size_t i=0; i<clientsCnt; i++)
+  clients[i].join();
 
 }
 
