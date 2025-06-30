@@ -9,6 +9,8 @@
 #include <condition_variable>
 #include <sstream>
 #include <string>
+#include <atomic>
+#include <barrier>
 
 extern "C" {
 #include <rdma/fabric.h>
@@ -44,6 +46,7 @@ namespace {
   hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
   hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
   hints->caps = FI_MSG |  FI_RMA | FI_TAGGED | FI_SOURCE |  FI_DIRECTED_RECV;
+  hints->tx_attr->op_flags = FI_DELIVERY_COMPLETE;
 
   return hints;
 }
@@ -100,10 +103,14 @@ void CHECK(int ret, const std::source_location location = std::source_location::
 
 int main() {
 
+setenv("FI_SHM_DISABLE_CMA", "1", 0 /*overwrite*/);
+
 static constexpr size_t bufferSize{1000};
+static constexpr size_t numClients{4};
 
 std::vector<char> serverAddr{};
-std::vector<char> clientAddr{};
+std::vector<std::vector<char>> clientAddr(numClients, std::vector<char>{});
+std::atomic<size_t> clientReadyCnt = 0;
 uint32_t serverAddrFormat = 0;
 std::mutex serverDataMtx;
 std::condition_variable serverCv;
@@ -112,6 +119,8 @@ std::condition_variable clientCv;
 
 bool serverDataReady = false;
 bool clientDataReady = false;
+
+// std::barrier sync_point(numClients+1);
 
 std::thread server([&]{
     fi_info *hints = makeHints();
@@ -141,11 +150,18 @@ std::thread server([&]{
     CHECK(fi_ep_bind(ep, &av->fid, 0));
     CHECK(fi_enable(ep));
 
-    auto buf = malloc(bufferSize);
+    char** buf =  (char**) malloc(numClients * sizeof(char*));
+    for (int i = 0; i < numClients; i++) {
+      buf[i] = (char*) malloc(bufferSize);
+    }
+
     std::size_t PP_MR_KEY = 0xC0DE;
-    fid_mr *mr = nullptr;
-    auto flags = FI_SEND | FI_RECV | FI_REMOTE_READ | FI_REMOTE_WRITE;
-    fi_mr_reg(domain, buf, bufferSize, flags, 0, PP_MR_KEY, 0, &(mr), nullptr);
+    std::vector<fid_mr *>mrs(numClients, nullptr);
+    for (size_t i = 0; i < numClients; ++i)
+    {
+        auto flags = FI_SEND | FI_RECV | FI_REMOTE_READ | FI_REMOTE_WRITE;
+        fi_mr_reg(domain, buf[i], bufferSize, flags, 0, PP_MR_KEY + i, 0, &mrs[i], nullptr);
+    }
 
     const auto localAddr = getAddr(&ep->fid);
     fi_addr_t localFiAddr = 0;
@@ -159,24 +175,34 @@ std::thread server([&]{
         serverAddr = localAddr;
         serverAddrFormat = info->addr_format;
         serverDataReady = true;
-        serverCv.notify_one();
+        serverCv.notify_all();
     }
 
     std::unique_lock lock(clientDataMtx);
-    clientCv.wait(lock, [&] { return clientDataReady; });
+    clientCv.wait(lock, [&] { return clientReadyCnt == numClients; });
 
-    fi_addr_t remoteFiAddr = 0;
-    CHECK(fi_av_insert(av, clientAddr.data(), 1, &remoteFiAddr, 0, nullptr) < 0);
+    std::vector<fi_addr_t> remoteFiAddrs(numClients, 0);
+        for (auto i = 0U; i < numClients; ++i)
+      CHECK(fi_av_insert(av, clientAddr[i].data(), 1, &remoteFiAddrs[i], 0, nullptr) < 0);
 
 
-    while (fi_recv(ep, buf, bufferSize, fi_mr_desc(mr), remoteFiAddr, nullptr) != 0);
+    for (auto i = 0U; i < numClients; ++i)
+      while (fi_recv(ep, buf[i], bufferSize, fi_mr_desc(mrs[i]), remoteFiAddrs[i], nullptr) != 0);
 
     fi_cq_err_entry comp{};
 
     while (fi_cq_readfrom(rxCq, &comp, 1, &comp.src_addr) < 0);
 
-    fi_close(&mr->fid);
+    // sync_point.arrive_and_wait();
+
+    for (auto & mr : mrs)
+      fi_close(&mr->fid);
+
+    for (int i = 0; i < numClients; i++)
+      free(buf[i]);
+
     free(buf);
+
     fi_close(&ep->fid);
     fi_close(&av->fid);
     fi_close(&rxCq->fid);
@@ -187,7 +213,11 @@ std::thread server([&]{
     fi_freeinfo(hints);
 });
 
-std::thread client([&]{
+std::vector<std::thread> clients;
+clients.reserve(numClients);
+
+for (auto i = 0U; i < numClients; i++) {
+  clients.emplace_back([&, id = i]{
     fi_info *hints = makeHints();
     fi_info *info = nullptr;
     fid_fabric *fabric = nullptr;
@@ -200,8 +230,10 @@ std::thread client([&]{
     auto txCqAtrr = initCqAttrDefault();
     auto avAttr = initAvAttrDefault();
 
-    std::unique_lock lock(serverDataMtx);
-    serverCv.wait(lock, [&] { return serverDataReady; });
+    {
+      std::unique_lock lock(serverDataMtx);
+      serverCv.wait(lock, [&] { return serverDataReady; });
+    }
 
     hints->dest_addrlen = serverAddr.size();
     hints->addr_format = serverAddrFormat;
@@ -229,12 +261,11 @@ std::thread client([&]{
     CHECK(fi_mr_reg(domain, buf, bufferSize, flags, 0, PP_MR_KEY, 0, &(mr), nullptr));
 
     const auto localAddr = getAddr(&ep->fid);
-
     {
         std::unique_lock lock(clientDataMtx);
-        clientAddr = localAddr;
-        clientDataReady = true;
-        clientCv.notify_one();
+        clientAddr[id] = localAddr;
+        ++clientReadyCnt;
+        clientCv.notify_all();
     }
 
     fi_addr_t localFiAddr = 0;
@@ -253,9 +284,11 @@ std::thread client([&]{
 
     while (fi_cq_readfrom(txCq, &comp, 1, &comp.src_addr) < 0);
 
+    // sync_point.arrive_and_wait();
+
     fi_close(&mr->fid);
-    free(buf);
     fi_close(&ep->fid);
+    free(buf);
     fi_close(&av->fid);
     fi_close(&rxCq->fid);
     fi_close(&txCq->fid);
@@ -265,9 +298,11 @@ std::thread client([&]{
     hints->dest_addr = nullptr;
     fi_freeinfo(hints);
 });
+}
 
 server.join();
-client.join();
+for (auto & client : clients)
+  client.join();
 
 }
 
