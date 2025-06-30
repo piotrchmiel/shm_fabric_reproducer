@@ -120,7 +120,7 @@ std::condition_variable clientCv;
 bool serverDataReady = false;
 bool clientDataReady = false;
 
-// std::barrier sync_point(numClients+1);
+std::barrier sync_point(numClients+1);
 
 std::thread server([&]{
     fi_info *hints = makeHints();
@@ -193,7 +193,7 @@ std::thread server([&]{
 
     while (fi_cq_readfrom(rxCq, &comp, 1, &comp.src_addr) < 0);
 
-    // sync_point.arrive_and_wait();
+    sync_point.arrive_and_wait();
 
     for (auto & mr : mrs)
       fi_close(&mr->fid);
@@ -284,7 +284,7 @@ for (auto i = 0U; i < numClients; i++) {
 
     while (fi_cq_readfrom(txCq, &comp, 1, &comp.src_addr) < 0);
 
-    // sync_point.arrive_and_wait();
+    sync_point.arrive_and_wait();
 
     fi_close(&mr->fid);
     fi_close(&ep->fid);
