@@ -20,6 +20,7 @@ extern "C" {
 #include <rdma/fi_rma.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_errno.h>
+#include <rdma/fi_tagged.h>
 }
 
 
@@ -43,8 +44,6 @@ namespace {
   hints->ep_attr->protocol = FI_PROTO_UNSPEC;
   hints->addr_format = FI_FORMAT_UNSPEC;
   hints->dest_addr = nullptr;
-  hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
-  hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
   hints->caps = FI_MSG |  FI_RMA | FI_TAGGED | FI_SOURCE |  FI_DIRECTED_RECV;
   hints->tx_attr->op_flags = FI_DELIVERY_COMPLETE;
 
@@ -120,8 +119,6 @@ std::condition_variable clientCv;
 bool serverDataReady = false;
 bool clientDataReady = false;
 
-std::barrier sync_point(numClients+1);
-
 std::thread server([&]{
     fi_info *hints = makeHints();
     fi_info *info = nullptr;
@@ -187,13 +184,11 @@ std::thread server([&]{
 
 
     for (auto i = 0U; i < numClients; ++i)
-      while (fi_recv(ep, buf[i], bufferSize, fi_mr_desc(mrs[i]), remoteFiAddrs[i], nullptr) != 0);
+      while (fi_trecv(ep, buf[i], bufferSize, fi_mr_desc(mrs[i]), remoteFiAddrs[i], i, 0ULL, nullptr) != 0);
 
     fi_cq_err_entry comp{};
 
     while (fi_cq_readfrom(rxCq, &comp, 1, &comp.src_addr) < 0);
-
-    sync_point.arrive_and_wait();
 
     for (auto & mr : mrs)
       fi_close(&mr->fid);
@@ -278,13 +273,12 @@ for (auto i = 0U; i < numClients; i++) {
     fi_addr_t remoteFiAddr = 0;
     CHECK(fi_av_insert(av, hints->dest_addr, 1, &remoteFiAddr, 0, nullptr) < 0);
 
-    while (fi_send(ep, buf, bufferSize, fi_mr_desc(mr), remoteFiAddr, nullptr) != 0);
+    while (fi_tsend(ep, buf, bufferSize, fi_mr_desc(mr), remoteFiAddr, id, nullptr) != 0);
 
     fi_cq_err_entry comp{};
 
     while (fi_cq_readfrom(txCq, &comp, 1, &comp.src_addr) < 0);
 
-    sync_point.arrive_and_wait();
 
     fi_close(&mr->fid);
     fi_close(&ep->fid);
